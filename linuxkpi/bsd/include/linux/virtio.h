@@ -59,6 +59,7 @@ struct linux_virtqueue {
 	/* FreeBSD */
 	struct virtqueue *bsd_vq;	/* virtqueue(9): before the #define */
 	struct sglist *bsd_sg;		/* segments for virtqueue_enqueue() */
+	struct list_head bsd_bounce;	/* copies of oversized requests */
 };
 #define	virtqueue	linux_virtqueue
 

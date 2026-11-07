@@ -86,6 +86,69 @@ lkpi_append_sg(struct sglist *fsg, struct scatterlist *sg, bool merge)
 	return (0);
 }
 
+/*
+ * Unlike Linux, virtqueue(9) limits a request to VIRTIO_MAX_INDIRECT segments
+ * and fails larger ones (e.g. a scattered ATTACH_BACKING) with EFBIG, which
+ * Linux drivers don't handle.  When the device-readable part doesn't fit, pass
+ * a physically contiguous copy instead, freed once virtqueue_dequeue() returns
+ * the request.  The caller holds its queue lock, so this must *not* sleep.
+ */
+struct lkpi_virtio_bounce {
+	struct list_head	link;
+	void			*cookie;
+	void			*buf;
+};
+
+static int
+lkpi_virtqueue_bounce(struct linux_virtqueue *vq, struct scatterlist *sgs[],
+    unsigned int out_sgs, void *data)
+{
+	struct lkpi_virtio_bounce *b;
+	struct scatterlist *sg;
+	size_t len, off;
+	unsigned int i;
+
+	len = 0;
+	for (i = 0; i < out_sgs; i++)
+		for (sg = sgs[i]; sg != NULL; sg = sg_next(sg))
+			len += sg->length;
+	b = malloc(sizeof(*b), M_LKPI_VIRTIO, M_NOWAIT);
+	if (b == NULL)
+		return (ENOMEM);
+	b->buf = contigmalloc(len, M_LKPI_VIRTIO, M_NOWAIT, 0, ~(vm_paddr_t)0,
+	    PAGE_SIZE, 0);
+	if (b->buf == NULL) {
+		free(b, M_LKPI_VIRTIO);
+		return (ENOMEM);
+	}
+	off = 0;
+	for (i = 0; i < out_sgs; i++)
+		for (sg = sgs[i]; sg != NULL; sg = sg_next(sg)) {
+			memcpy((char *)b->buf + off, sg_virt(sg), sg->length);
+			off += sg->length;
+		}
+	b->cookie = data;
+	list_add_tail(&b->link, &vq->bsd_bounce);
+
+	sglist_reset(vq->bsd_sg);
+	return (sglist_append(vq->bsd_sg, b->buf, len));
+}
+
+static void
+lkpi_virtqueue_unbounce(struct linux_virtqueue *vq, void *cookie)
+{
+	struct lkpi_virtio_bounce *b;
+
+	list_for_each_entry(b, &vq->bsd_bounce, link) {
+		if (b->cookie == cookie) {
+			list_del(&b->link);
+			free(b->buf, M_LKPI_VIRTIO);
+			free(b, M_LKPI_VIRTIO);
+			return;
+		}
+	}
+}
+
 int
 linuxkpi_virtqueue_add_sgs(struct linux_virtqueue *vq,
     struct scatterlist *sgs[], unsigned int out_sgs, unsigned int in_sgs,
@@ -95,13 +158,19 @@ linuxkpi_virtqueue_add_sgs(struct linux_virtqueue *vq,
 	struct scatterlist *sg;
 	unsigned int i;
 	int readable, error;
-	bool merge;
+	bool merge, bounced;
 
 	sglist_reset(fsg);
 	error = 0;
+	bounced = false;
 	for (i = 0; i < out_sgs && error == 0; i++)
 		for (sg = sgs[i]; sg != NULL && error == 0; sg = sg_next(sg))
 			error = lkpi_append_sg(fsg, sg, true);
+	if (error == EFBIG) {
+		error = lkpi_virtqueue_bounce(vq, sgs, out_sgs, data);
+		bounced = (error == 0);
+		i = out_sgs;
+	}
 	readable = fsg->sg_nseg;
 	merge = false;
 	for (; i < out_sgs + in_sgs && error == 0; i++)
@@ -112,6 +181,8 @@ linuxkpi_virtqueue_add_sgs(struct linux_virtqueue *vq,
 	if (error == 0)
 		error = virtqueue_enqueue(vq->bsd_vq, data, fsg, readable,
 		    fsg->sg_nseg - readable);
+	if (error != 0 && bounced)
+		lkpi_virtqueue_unbounce(vq, data);
 	if (error == EMSGSIZE)		/* Linux has only ENOSPC for "full" */
 		error = ENOSPC;
 	vq->num_free = virtqueue_nfree(vq->bsd_vq);
@@ -124,6 +195,8 @@ linuxkpi_virtqueue_get_buf(struct linux_virtqueue *vq, unsigned int *len)
 	void *cookie;
 
 	cookie = virtqueue_dequeue(vq->bsd_vq, len);
+	if (cookie != NULL && !list_empty(&vq->bsd_bounce))
+		lkpi_virtqueue_unbounce(vq, cookie);
 	vq->num_free = virtqueue_nfree(vq->bsd_vq);
 	return (cookie);
 }
@@ -224,8 +297,17 @@ lkpi_virtio_del_vqs(struct virtio_device *vdev)
 
 	lkpi_virtio_stop_callbacks(vdev);
 	/* The virtqueue(9) side is freed when the newbus child detaches. */
-	for (i = 0; i < vdev->bsd_nvqs; i++)
-		sglist_free(vdev->bsd_vqs[i].bsd_sg);
+	for (i = 0; i < vdev->bsd_nvqs; i++) {
+		struct linux_virtqueue *vq = &vdev->bsd_vqs[i];
+		struct lkpi_virtio_bounce *b, *tb;
+
+		list_for_each_entry_safe(b, tb, &vq->bsd_bounce, link) {
+			list_del(&b->link);
+			free(b->buf, M_LKPI_VIRTIO);
+			free(b, M_LKPI_VIRTIO);
+		}
+		sglist_free(vq->bsd_sg);
+	}
 	free(vdev->bsd_vqs, M_LKPI_VIRTIO);
 	vdev->bsd_vqs = NULL;
 	vdev->bsd_nvqs = 0;
@@ -255,6 +337,7 @@ linuxkpi_virtio_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 		vq = &vdev->bsd_vqs[i];
 		vq->vdev = vdev;
 		vq->callback = vqs_info[i].callback;
+		INIT_LIST_HEAD(&vq->bsd_bounce);
 		VQ_ALLOC_INFO_INIT(&info[i], VIRTIO_MAX_INDIRECT,
 		    lkpi_virtio_intr, vdev, &vq->bsd_vq, "%s %s",
 		    device_get_nameunit(dev), vqs_info[i].name);
